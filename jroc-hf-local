@@ -1,0 +1,683 @@
+### PowerShell script to create and populate `jroc-hf-local` (single file)
+
+```powershell
+# create_and_populate_jroc_hf_local.ps1
+Param(
+  [string]$Target = "jroc-hf-local"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$root = Join-Path (Get-Location) $Target
+
+function New-Folder($path) {
+  if (-not (Test-Path $path)) {
+    New-Item -ItemType Directory -Path $path | Out-Null
+  }
+}
+
+function Write-File($path, $content) {
+  $dir = Split-Path $path -Parent
+  New-Folder $dir
+  $content | Out-File -FilePath $path -Encoding utf8 -Force
+  Write-Host "Wrote $path"
+}
+
+Write-Host "Creating project folder at $root"
+New-Folder $root
+
+# Create folder structure
+New-Folder (Join-Path $root "src\models")
+New-Folder (Join-Path $root "src\llm")
+New-Folder (Join-Path $root "examples")
+New-Folder (Join-Path $root "scripts")
+New-Folder (Join-Path $root "migrations")
+New-Folder (Join-Path $root "telemetry")
+
+# Files content (full)
+$ModelRegistry = @'
+/* src/models/ModelRegistry.hf.ts */
+import { LLMModel } from './ModelTypes';
+
+export const HF_MODEL_REGISTRY: LLMModel[] = [
+  {
+    id: 'local-hf-gptj-6b',
+    name: 'Local GPT-J 6B',
+    provider: 'local-hf',
+    hf_repo: 'EleutherAI/gpt-j-6B',
+    contextTokens: 65000,
+    maxOutputTokens: 2048,
+    capabilities: ['reasoning','role_execution','workflow_obedience'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true,
+    notes: 'Run via local HF FastAPI, TGI, or Ollama.'
+  },
+  {
+    id: 'local-redpajama-7b',
+    name: 'Local RedPajama INCITE 7B',
+    provider: 'local-hf',
+    hf_repo: 'togethercomputer/RedPajama-INCITE-7B-v1',
+    contextTokens: 65000,
+    maxOutputTokens: 2048,
+    capabilities: ['reasoning','role_execution'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true
+  },
+  {
+    id: 'local-redpajama-3b',
+    name: 'Local RedPajama INCITE 3B',
+    provider: 'local-hf',
+    hf_repo: 'togethercomputer/RedPajama-INCITE-3B-v1',
+    contextTokens: 65000,
+    maxOutputTokens: 1024,
+    capabilities: ['role_execution','workflow_obedience'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true
+  },
+  {
+    id: 'local-phi-1.4b',
+    name: 'Local Phi 1.4B (phi-mini)',
+    provider: 'local-hf',
+    hf_repo: 'TheBloke/phi-3-mini-1.4B',
+    contextTokens: 32000,
+    maxOutputTokens: 1024,
+    capabilities: ['role_execution','workflow_obedience'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true
+  },
+  {
+    id: 'local-mpt-7b-instruct',
+    name: 'Local MPT 7B Instruct',
+    provider: 'local-hf',
+    hf_repo: 'mosaicml/mpt-7b-instruct',
+    contextTokens: 65000,
+    maxOutputTokens: 2048,
+    capabilities: ['structured_output','policy_review'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true
+  },
+  {
+    id: 'local-bloom-3b',
+    name: 'Local BLOOM 3B',
+    provider: 'local-hf',
+    hf_repo: 'bigscience/bloom-3b',
+    contextTokens: 65000,
+    maxOutputTokens: 2048,
+    capabilities: ['multilingual','reasoning'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true
+  },
+  {
+    id: 'local-oasst-7b',
+    name: 'Local OASST 7B',
+    provider: 'local-hf',
+    hf_repo: 'OpenAssistant/research-oasst-model-7b-hf',
+    contextTokens: 65000,
+    maxOutputTokens: 2048,
+    capabilities: ['assistant','role_execution'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true
+  },
+  {
+    id: 'local-opt-6.7b',
+    name: 'Local OPT 6.7B',
+    provider: 'local-hf',
+    hf_repo: 'facebook/opt-6.7b',
+    contextTokens: 65000,
+    maxOutputTokens: 2048,
+    capabilities: ['causal','deterministic'],
+    modalities: ['text'],
+    isFreeTier: true,
+    isLocal: true
+  }
+];
+'@
+
+$LLMClient = @'
+/* src/llm/LLMClient.hf.ts */
+import fetch from 'node-fetch';
+import { LLMModel } from '../models/ModelTypes';
+import { HF_MODEL_REGISTRY } from '../models/ModelRegistry.hf';
+
+export async function callLLM(model: LLMModel, prompt: string): Promise<{ output: string; meta?: any }> {
+  try {
+    if ((model as any).provider === 'local-hf') {
+      return { output: await callLocalHF(model, prompt) };
+    }
+    if ((model as any).provider === 'huggingface') {
+      return { output: await callHuggingFace(model, prompt) };
+    }
+    const fallback = HF_MODEL_REGISTRY.find(m => m.isLocal && m.provider === 'local-hf');
+    if (fallback) return { output: await callLocalHF(fallback, prompt) };
+    throw new Error('No available model provider');
+  } catch (err) {
+    throw err;
+  }
+}
+
+async function callHuggingFace(model: LLMModel, prompt: string): Promise<string> {
+  const apiKey = process.env.HF_API_KEY;
+  if (!apiKey) throw new Error('HF_API_KEY not set');
+  const repo = (model as any).hf_repo ?? model.id;
+  const url = `https://api-inference.huggingface.co/models/${encodeURIComponent(repo)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inputs: prompt, parameters: { max_new_tokens: model.maxOutputTokens ?? 512 } })
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`HuggingFace error: ${res.status} ${text}`);
+  }
+  const json = await res.json();
+  if (Array.isArray(json) && json[0]?.generated_text) return json[0].generated_text;
+  if (json.generated_text) return json.generated_text;
+  if (json.error) throw new Error(`HF inference error: ${json.error}`);
+  return JSON.stringify(json);
+}
+
+async function callLocalHF(model: LLMModel, prompt: string): Promise<string> {
+  const repo = (model as any).hf_repo ?? model.id;
+  const url = process.env.LOCAL_HF_URL || 'http://localhost:8000/generate';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.LOCAL_HF_API_KEY ?? '' },
+    body: JSON.stringify({ model: repo, prompt, max_new_tokens: model.maxOutputTokens ?? 512 })
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Local HF error: ${res.status} ${text}`);
+  }
+  const json = await res.json();
+  return json.output ?? JSON.stringify(json);
+}
+'@
+
+$LocalServer = @'
+# local_hf_server.py
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from typing import Optional
+import uvicorn
+import os
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+app = FastAPI()
+MODEL_CACHE = {}
+
+class GenRequest(BaseModel):
+    model: str
+    prompt: str
+    max_new_tokens: Optional[int] = 512
+
+def load_model(model_name: str):
+    if model_name in MODEL_CACHE:
+        return MODEL_CACHE[model_name]
+    device = 0 if torch.cuda.is_available() else -1
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto" if torch.cuda.is_available() else None,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    )
+    gen = pipeline("text-generation", model=model, tokenizer=tokenizer, device=device if device >= 0 else -1)
+    MODEL_CACHE[model_name] = gen
+    return gen
+
+@app.post("/generate")
+async def generate(req: GenRequest, request: Request):
+    api_key = os.environ.get("LOCAL_HF_API_KEY")
+    if api_key:
+        header_key = request.headers.get("x-api-key")
+        if header_key != api_key:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        gen = load_model(req.model)
+        out = gen(req.prompt, max_new_tokens=req.max_new_tokens, do_sample=False, return_full_text=False)
+        text = out[0]['generated_text'] if isinstance(out, list) else out.get('generated_text', str(out))
+        return {"output": text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run("local_hf_server:app", host="0.0.0.0", port=int(os.environ.get("LOCAL_HF_PORT", 8000)), workers=1)
+'@
+
+$Dockerfile = @'
+# Dockerfile.hf
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY local_hf_server.py .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "local_hf_server:app", "--host", "0.0.0.0", "--port", "8000"]
+'@
+
+$Requirements = @'
+fastapi
+uvicorn[standard]
+transformers>=4.30.0
+torch
+sentencepiece
+'@
+
+$DockerCompose = @'
+# docker-compose.hf.yml
+version: "3.8"
+services:
+  local-hf:
+    build:
+      context: .
+      dockerfile: Dockerfile.hf
+    container_name: local-hf
+    environment:
+      - LOCAL_HF_PORT=8000
+      - LOCAL_HF_API_KEY=${LOCAL_HF_API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models:ro
+    restart: unless-stopped
+
+  unified-api-example:
+    image: node:18
+    container_name: unified-api-example
+    working_dir: /app
+    volumes:
+      - ./unified-api:/app
+    command: ["node", "server.js"]
+    environment:
+      - LOCAL_HF_URL=http://local-hf:8000/generate
+    depends_on:
+      - local-hf
+'@
+
+$StartPS = @'
+# scripts\start_local_models.ps1
+Param(
+  [string]$ComposeFile = "docker-compose.hf.yml",
+  [switch]$Rebuild
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+Push-Location $repoRoot
+
+$modelsDir = Join-Path $repoRoot "models"
+if (-not (Test-Path $modelsDir)) {
+  Write-Host "Creating models directory at $modelsDir"
+  New-Item -ItemType Directory -Path $modelsDir | Out-Null
+}
+
+if ($Rebuild) {
+  Write-Host "Rebuilding images and starting services..."
+  docker-compose -f $ComposeFile build --no-cache
+  docker-compose -f $ComposeFile up -d --force-recreate
+} else {
+  Write-Host "Starting services (build if needed)..."
+  docker-compose -f $ComposeFile up -d --build
+}
+
+Write-Host "Waiting for local HF service to become healthy..."
+Start-Sleep -Seconds 6
+
+$healthUrl = "http://localhost:8000/generate"
+for ($i = 0; $i -lt 12; $i++) {
+  try {
+    $resp = Invoke-RestMethod -Method Post -Uri $healthUrl -ContentType "application/json" -Body (@{ model = "TheBloke/phi-3-mini-1.4B"; prompt = "ping"; max_new_tokens = 1 } | ConvertTo-Json)
+    if ($resp.output) {
+      Write-Host "Local HF service responded."
+      break
+    }
+  } catch {
+    Write-Host "Waiting for service... ($($i+1)/12)"
+    Start-Sleep -Seconds 5
+  }
+}
+
+Write-Host "Services started. Use 'docker-compose -f $ComposeFile logs -f' to follow logs."
+Pop-Location
+'@
+
+$SetEnvPS = @'
+# scripts\set_env.ps1
+Param(
+  [string]$OutFile = ".env"
+)
+
+$envVars = @{
+  POSTGRES_URL = $env:POSTGRES_URL
+  CLICKHOUSE_URL = $env:CLICKHOUSE_URL
+  LOCAL_HF_API_KEY = $env:LOCAL_HF_API_KEY
+  LOCAL_HF_URL = $env:LOCAL_HF_URL
+  HF_API_KEY = $env:HF_API_KEY
+  UNIFIED_API_URL = $env:UNIFIED_API_URL
+}
+
+foreach ($k in $envVars.Keys) {
+  if (-not $envVars[$k]) {
+    $val = Read-Host "Enter value for $k (leave blank to skip)"
+    if ($val) { $envVars[$k] = $val }
+  }
+}
+
+$lines = @()
+foreach ($k in $envVars.Keys) {
+  if ($envVars[$k]) { $lines += "$k=$($envVars[$k])" }
+}
+
+$lines | Out-File -FilePath $OutFile -Encoding utf8
+Write-Host "Wrote $OutFile with provided values."
+'@
+
+$TestPS = @'
+# scripts\test_hf_workflow.ps1
+Param(
+  [string]$UnifiedUrl = "http://localhost:3000/unified/generate"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function PostJson($url, $obj) {
+  $body = $obj | ConvertTo-Json -Depth 10
+  return Invoke-RestMethod -Method Post -Uri $url -ContentType "application/json" -Body $body
+}
+
+Write-Host "Calling manager (redpajama) to create a plan..."
+$managerReq = @{
+  input = "Create a 3-step plan to build a dashboard module."
+  taskType = "plan"
+  preferredProvider = "local-hf"
+  preferredModel = "local-redpajama-7b"
+  preferLocal = $true
+}
+
+$managerRes = PostJson $UnifiedUrl $managerReq
+Write-Host "Manager response:"
+$managerRes | ConvertTo-Json -Depth 6 | Write-Host
+
+$planText = if ($managerRes.output) { $managerRes.output } else { ($managerRes | ConvertTo-Json -Depth 6) }
+
+Write-Host "Calling worker (phi-mini) to execute the plan..."
+$workerReq = @{
+  input = "Execute the plan:`n$planText"
+  taskType = "execute"
+  preferredProvider = "local-hf"
+  preferredModel = "local-phi-1.4b"
+  preferLocal = $true
+}
+
+$workerRes = PostJson $UnifiedUrl $workerReq
+Write-Host "Worker response:"
+$workerRes | ConvertTo-Json -Depth 6 | Write-Host
+'@
+
+$ExampleTS = @'
+// examples/test_hf_workflow.ts
+import fetch from "node-fetch";
+
+async function runTest() {
+  const unifiedUrl = process.env.UNIFIED_API_URL || "http://localhost:3000/unified/generate";
+
+  const managerReq = {
+    input: "Create a 3-step plan to build a dashboard module.",
+    taskType: "plan",
+    preferredProvider: "local-hf",
+    preferredModel: "local-redpajama-7b",
+    preferLocal: true
+  };
+
+  const managerRes = await fetch(unifiedUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(managerReq)
+  });
+  const managerJson = await managerRes.json();
+  console.log("Manager output:", managerJson);
+
+  const workerReq = {
+    input: `Execute the plan:\n${JSON.stringify(managerJson.output || managerJson, null, 2)}`,
+    taskType: "execute",
+    preferredProvider: "local-hf",
+    preferredModel: "local-phi-1.4b",
+    preferLocal: true
+  };
+
+  const workerRes = await fetch(unifiedUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(workerReq)
+  });
+  const workerJson = await workerRes.json();
+  console.log("Worker output:", workerJson);
+}
+
+runTest().catch(e => { console.error(e); process.exit(1); });
+'@
+
+$MigrationSQL = @'
+-- migrations/pg_create_hf_models.sql
+INSERT INTO models (id, name, provider, metadata, is_local, is_free_tier, created_at)
+VALUES
+('local-hf-gptj-6b', 'Local GPT-J 6B', 'local-hf', '{"hf_repo":"EleutherAI/gpt-j-6B"}', true, true, NOW()),
+('local-redpajama-7b', 'Local RedPajama 7B', 'local-hf', '{"hf_repo":"togethercomputer/RedPajama-INCITE-7B-v1"}', true, true, NOW()),
+('local-phi-1.4b', 'Local Phi 1.4B', 'local-hf', '{"hf_repo":"TheBloke/phi-3-mini-1.4B"}', true, true, NOW());
+'@
+
+$TelemetryTS = @'
+// telemetry/hf_telemetry_hook.ts
+import { Pool } from "pg";
+import { ClickHouse } from "@clickhouse/client";
+
+const pg = new Pool({ connectionString: process.env.POSTGRES_URL });
+const ch = new ClickHouse({ url: process.env.CLICKHOUSE_URL });
+
+export async function recordHFUsage({ tenantId = "default", modelId, roleId, workflowId, orderId, latencyMs, qualityScore = null }) {
+  await pg.query(
+    `INSERT INTO telemetry_hf (tenant_id, model_id, role_id, workflow_id, order_id, latency_ms, quality_score, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+    [tenantId, modelId, roleId, workflowId, orderId, latencyMs, qualityScore]
+  );
+
+  await ch.insert({
+    table: "telemetry",
+    values: [
+      {
+        timestamp: new Date(),
+        tenant_id: tenantId,
+        model_id: modelId,
+        model_provider: "local-hf",
+        role_id: roleId,
+        workflow_id: workflowId,
+        order_id: orderId,
+        latency_ms: latencyMs,
+        quality_score: qualityScore ?? 0.0
+      }
+    ]
+  });
+}
+'@
+
+$ReadmeLocal = @'
+# README HF Local
+
+## Purpose
+Run free Hugging Face models locally for JROC Factory. This guide covers dev FastAPI server and Docker compose.
+
+## Quick start
+1. Place model weights under `./models/<repo-name>` or configure TGI.
+2. Build and run:
+   ```bash
+   docker-compose -f docker-compose.hf.yml up -d --build
+   ```
+3. Test:
+   ```bash
+   curl -X POST http://localhost:8000/generate -H "Content-Type: application/json" -d '\''{"model":"TheBloke/phi-3-mini-1.4B","prompt":"Hello","max_new_tokens":32}'\''
+   ```
+
+## Notes
+- For large models use TGI or Ollama.
+- Use quantization (bitsandbytes / GGML) to reduce VRAM.
+- Protect local endpoint with `LOCAL_HF_API_KEY` environment variable.
+'@
+
+$ReadmeDeploy = @'
+# README Deploy
+
+## Production options
+- **Text Generation Inference (TGI)**: recommended for 7B+ models, supports multi-GPU and efficient batching.
+- **Ollama**: simple local hosting with model management.
+- **Kubernetes**: use GPU node pools and autoscaling for TGI.
+
+## Quantization
+- Use `bitsandbytes` 4-bit quantization for 7B models to run on 24GB GPUs.
+- For CPU-only, convert to GGML and use a GGML runtime.
+
+## Security
+- Use mTLS or API keys for local endpoints.
+- Limit access to internal networks.
+'@
+
+$EnvExample = @'
+POSTGRES_URL=postgres://user:pass@localhost:5432/jroc
+CLICKHOUSE_URL=http://localhost:8123
+LOCAL_HF_API_KEY=changeme
+LOCAL_HF_URL=http://localhost:8000/generate
+HF_API_KEY=hf_...
+UNIFIED_API_URL=http://localhost:3000/unified/generate
+'@
+
+$GitIgnore = @'
+# Node
+node_modules/
+dist/
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+venv/
+models/
+
+# Docker
+docker-compose.override.yml
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+'@
+
+$CreateScript = @'
+# create_jroc_hf_folder.ps1
+Param(
+  [string]$Target = "jroc-hf-local"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$root = Join-Path (Get-Location) $Target
+
+Write-Host "Creating project folder at $root"
+New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+function New-Folder($path) {
+  if (-not (Test-Path $path)) {
+    New-Item -ItemType Directory -Path $path | Out-Null
+    Write-Host "Created folder: $path"
+  }
+}
+
+function New-File($filePath, $content) {
+  $dir = Split-Path $filePath -Parent
+  New-Folder $dir
+  if (-not (Test-Path $filePath)) {
+    $content | Out-File -FilePath $filePath -Encoding utf8
+    Write-Host "Created file: $filePath"
+  } else {
+    Write-Host "File already exists: $filePath"
+  }
+}
+
+New-Folder (Join-Path $root "src\models")
+New-Folder (Join-Path $root "src\llm")
+New-Folder (Join-Path $root "examples")
+New-Folder (Join-Path $root "scripts")
+New-Folder (Join-Path $root "migrations")
+New-Folder (Join-Path $root "telemetry")
+
+New-File (Join-Path $root "src\models\ModelRegistry.hf.ts") "// ModelRegistry.hf.ts - paste full registry content here"
+New-File (Join-Path $root "src\llm\LLMClient.hf.ts") "// LLMClient.hf.ts - paste client functions here"
+New-File (Join-Path $root "examples\test_hf_workflow.ts") "// test_hf_workflow.ts - paste example test workflow here"
+New-File (Join-Path $root "local_hf_server.py") "# local_hf_server.py - paste FastAPI server code here"
+New-File (Join-Path $root "Dockerfile.hf") "# Dockerfile.hf - paste Dockerfile content here"
+New-File (Join-Path $root "docker-compose.hf.yml") "# docker-compose.hf.yml - paste compose content here"
+New-File (Join-Path $root "requirements.txt") "fastapi`nuvicorn[standard]`ntransformers>=4.30.0`ntorch`nsentencepiece"
+New-File (Join-Path $root "scripts\start_local_models.ps1") "# start_local_models.ps1 - paste start script here"
+New-File (Join-Path $root "scripts\test_hf_workflow.ps1") "# test_hf_workflow.ps1 - paste test script here"
+New-File (Join-Path $root "migrations\pg_create_hf_models.sql") "-- pg_create_hf_models.sql - paste SQL migration here"
+New-File (Join-Path $root "telemetry\hf_telemetry_hook.ts") "// hf_telemetry_hook.ts - paste telemetry hook here"
+New-File (Join-Path $root "README_HF_LOCAL.md") "# README_HF_LOCAL.md - paste README content here"
+New-File (Join-Path $root "README_DEPLOY.md") "# README_DEPLOY.md - paste deploy notes here"
+New-File (Join-Path $root ".env.example") "POSTGRES_URL=postgres://user:pass@localhost:5432/jroc`nCLICKHOUSE_URL=http://localhost:8123`nLOCAL_HF_API_KEY=changeme`nLOCAL_HF_URL=http://localhost:8000/generate`nHF_API_KEY=hf_...`nUNIFIED_API_URL=http://localhost:3000/unified/generate"
+
+Write-Host "Scaffold complete. Open $root and paste the full file contents where placeholders exist."
+'@
+
+# Write files to disk
+Write-File (Join-Path $root "src\models\ModelRegistry.hf.ts") $ModelRegistry
+Write-File (Join-Path $root "src\llm\LLMClient.hf.ts") $LLMClient
+Write-File (Join-Path $root "local_hf_server.py") $LocalServer
+Write-File (Join-Path $root "Dockerfile.hf") $Dockerfile
+Write-File (Join-Path $root "requirements.txt") $Requirements
+Write-File (Join-Path $root "docker-compose.hf.yml") $DockerCompose
+Write-File (Join-Path $root "scripts\start_local_models.ps1") $StartPS
+Write-File (Join-Path $root "scripts\set_env.ps1") $SetEnvPS
+Write-File (Join-Path $root "scripts\test_hf_workflow.ps1") $TestPS
+Write-File (Join-Path $root "examples\test_hf_workflow.ts") $ExampleTS
+Write-File (Join-Path $root "migrations\pg_create_hf_models.sql") $MigrationSQL
+Write-File (Join-Path $root "telemetry\hf_telemetry_hook.ts") $TelemetryTS
+Write-File (Join-Path $root "README_HF_LOCAL.md") $ReadmeLocal
+Write-File (Join-Path $root "README_DEPLOY.md") $ReadmeDeploy
+Write-File (Join-Path $root ".env.example") $EnvExample
+Write-File (Join-Path $root ".gitignore") $GitIgnore
+Write-File (Join-Path $root "create_jroc_hf_folder.ps1") $CreateScript
+
+Write-Host "All files created under $root"
+Write-Host "You can initialize git with: cd $Target; git init; git add .; git commit -m 'Initial jroc-hf-local scaffold'"
+```
+
+**Usage**
+
+1. Save the script above as `create_and_populate_jroc_hf_local.ps1`.
+2. Open PowerShell, navigate to the folder where you want the project created.
+3. Run:
+```powershell
+.\create_and_populate_jroc_hf_local.ps1
+```
+4. After completion, `jroc-hf-local` will contain the full scaffold and populated files. Initialize git if desired.
