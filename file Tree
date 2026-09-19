@@ -1,0 +1,30 @@
+jroc-hf-local/
+├─ src/
+│  ├─ models/
+│  │  └─ ModelRegistry.hf.ts
+│  └─ llm/
+│     └─ LLMClient.hf.ts
+│
+├─ local_hf_server.py
+├─ Dockerfile.hf
+├─ docker-compose.hf.yml
+├─ requirements.txt
+│
+├─ scripts/
+│  ├─ start_local_models.ps1
+│  ├─ set_env.ps1
+│  └─ test_hf_workflow.ps1
+│
+├─ examples/
+│  └─ test_hf_workflow.ts
+│
+├─ migrations/
+│  └─ pg_create_hf_models.sql
+│
+├─ telemetry/
+│  └─ hf_telemetry_hook.ts
+│
+├─ README_HF_LOCAL.md
+├─ README_DEPLOY.md
+├─ .env.example
+└─ .gitignore
